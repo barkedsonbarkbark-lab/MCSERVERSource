@@ -1,0 +1,459 @@
+﻿package com.mcserver.app
+
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val repository = AppRepository.get(this)
+        setContent {
+            MaterialTheme {
+                McServerApp(repository) { action ->
+                    startForegroundService(Intent(this, ServerHostService::class.java).setAction(action))
+                }
+            }
+        }
+    }
+}
+
+private enum class DashboardTab(val title: String) {
+    OVERVIEW("Overview"),
+    CONSOLE("Console"),
+    PLAYERS("Players"),
+    WORLD("World"),
+    PLUGINS("Plugins"),
+    MODS("Mods"),
+    SETTINGS("Settings"),
+    NETWORK("Network"),
+    BACKUPS("Backups")
+}
+
+@Composable
+private fun McServerApp(repository: AppRepository, onServiceAction: (String) -> Unit) {
+    val manager = repository.serverManager
+    var config by remember { mutableStateOf(manager.config()) }
+    var creating by remember { mutableStateOf(config == null) }
+    var tab by remember { mutableStateOf(DashboardTab.OVERVIEW) }
+    var name by remember { mutableStateOf("My Survival SMP") }
+    var version by remember { mutableStateOf("1.21.10") }
+    var type by remember { mutableStateOf(ServerType.PAPER) }
+    var ram by remember { mutableStateOf("2048") }
+    var world by remember { mutableStateOf("world") }
+    var message by remember { mutableStateOf<String?>(null) }
+    var running by remember { mutableStateOf(manager.isRunning()) }
+    var refreshTick by remember { mutableStateOf(0) }
+    var paperVersions by remember { mutableStateOf<List<String>>(emptyList()) }
+    var eulaAccepted by remember { mutableStateOf(manager.eulaAccepted()) }
+
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { manager.availablePaperVersions() }
+                .onSuccess { loaded -> paperVersions = loaded }
+        }
+
+        while (true) {
+            config = manager.config()
+            running = manager.isRunning()
+            refreshTick++
+            delay(1000)
+        }
+    }
+
+    if (creating) {
+        CreateScreen(
+            name = name,
+            onName = { name = it },
+            version = version,
+            onVersion = { version = it },
+            paperVersions = paperVersions,
+            eulaAccepted = eulaAccepted,
+            onEulaAccepted = { eulaAccepted = it },
+            type = type,
+            onType = { type = it },
+            ram = ram,
+            onRam = { ram = it.filter(Char::isDigit) },
+            world = world,
+            onWorld = { world = it },
+            onCreate = {
+                runCatching {
+                    val created = ServerConfig(
+                        name = name.ifBlank { "My Survival SMP" },
+                        version = version.ifBlank { "1.21.10" },
+                        type = type,
+                        ramMb = (ram.toIntOrNull() ?: 2048).coerceAtLeast(512),
+                        worldName = world.ifBlank { "world" }
+                    )
+                    check(eulaAccepted) { "Accept the Minecraft EULA before creating the managed server." }
+                    manager.create(created)
+                    manager.acceptEula()
+                    config = created
+                    creating = false
+                    message = "Server configuration and EULA consent saved."
+                }.onFailure {
+                    message = it.message ?: "Creation failed"
+                }
+            }
+        )
+        return
+    }
+
+    @Suppress("UNUSED_VARIABLE")
+    val ignoredRefresh = refreshTick
+
+    Scaffold { padding ->
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(16.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Spacer(Modifier.height(8.dp))
+            Text("MCSERVER", style = MaterialTheme.typography.headlineMedium)
+            Text(config?.name ?: "My Server", style = MaterialTheme.typography.titleLarge)
+            ServerCard(config, running, onServiceAction)
+            if (!eulaAccepted) {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("EULA REQUIRED", style = MaterialTheme.typography.titleMedium)
+                        Text("Minecraft must have an explicit EULA acceptance before the managed server can start.")
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Checkbox(checked = eulaAccepted, onCheckedChange = { checked ->
+                                if (checked) {
+                                    manager.acceptEula()
+                                    eulaAccepted = true
+                                }
+                            })
+                            Text("I have read and agree to Minecraft's EULA.")
+                        }
+                    }
+                }
+            }
+
+            DashboardTab.entries.chunked(3).forEach { row ->
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    row.forEach { candidate ->
+                        FilterChip(
+                            selected = tab == candidate,
+                            onClick = { tab = candidate },
+                            label = { Text(candidate.title) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+
+            TabContent(tab, manager)
+
+            message?.let {
+                Text(it, color = MaterialTheme.colorScheme.primary)
+            }
+
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (running) {
+                    Button(onClick = { onServiceAction(ServerHostService.ACTION_STOP) }, modifier = Modifier.weight(1f)) {
+                        Text("STOP")
+                    }
+                    TextButton(onClick = { onServiceAction(ServerHostService.ACTION_FORCE_STOP) }, modifier = Modifier.weight(1f)) {
+                        Text("FORCE STOP")
+                    }
+                } else {
+                    Button(onClick = { onServiceAction(ServerHostService.ACTION_START) }, modifier = Modifier.weight(1f)) {
+                        Text("START SERVER")
+                    }
+                }
+            }
+
+            TextButton(onClick = { onServiceAction(ServerHostService.ACTION_RESTART) }, enabled = running) {
+                Text("RESTART SERVER")
+            }
+        }
+    }
+}
+
+@Composable
+private fun CreateScreen(
+    name: String,
+    onName: (String) -> Unit,
+    version: String,
+    onVersion: (String) -> Unit,
+    paperVersions: List<String>,
+    eulaAccepted: Boolean,
+    onEulaAccepted: (Boolean) -> Unit,
+    type: ServerType,
+    onType: (ServerType) -> Unit,
+    ram: String,
+    onRam: (String) -> Unit,
+    world: String,
+    onWorld: (String) -> Unit,
+    onCreate: () -> Unit
+) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(20.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Spacer(Modifier.height(24.dp))
+        Text("MCSERVER", style = MaterialTheme.typography.headlineLarge)
+        Text("Create the one managed Minecraft server.")
+
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("CREATE SERVER", style = MaterialTheme.typography.titleLarge)
+                OutlinedTextField(value = name, onValueChange = onName, modifier = Modifier.fillMaxWidth(), label = { Text("Server Name") })
+                OutlinedTextField(value = version, onValueChange = onVersion, modifier = Modifier.fillMaxWidth(), label = { Text("Minecraft Version") })
+                if (paperVersions.isNotEmpty()) {
+                    Text("Stable Paper versions")
+                    paperVersions.take(12).chunked(3).forEach { row ->
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            row.forEach { candidate ->
+                                FilterChip(
+                                    selected = version == candidate,
+                                    onClick = { onVersion(candidate) },
+                                    label = { Text(candidate) },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                        }
+                    }
+                }
+                Text("Server Type")
+                ServerType.entries.forEach { candidate ->
+                    val supported = candidate == ServerType.PAPER || candidate == ServerType.GEYSER
+                    FilterChip(
+                        selected = type == candidate,
+                        onClick = { onType(candidate) },
+                        enabled = supported,
+                        label = { Text(if (supported) candidate.displayName else "${candidate.displayName} (unavailable)") }
+                    )
+                }
+                if (type == ServerType.GEYSER) {
+                    Text("Geyser adds Bedrock networking to the same Paper server process; it is not a second server.")
+                }
+                OutlinedTextField(value = ram, onValueChange = onRam, modifier = Modifier.fillMaxWidth(), label = { Text("RAM (MB)") })
+                OutlinedTextField(value = world, onValueChange = onWorld, modifier = Modifier.fillMaxWidth(), label = { Text("World Name") })
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Checkbox(checked = eulaAccepted, onCheckedChange = onEulaAccepted)
+                    Text("I have read and agree to Minecraft's EULA.")
+                }
+                Button(onClick = onCreate, enabled = eulaAccepted, modifier = Modifier.fillMaxWidth()) {
+                    Text("CREATE SERVER")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ServerCard(config: ServerConfig?, running: Boolean, onAction: (String) -> Unit) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(if (running) "â— ONLINE" else "â— OFFLINE", style = MaterialTheme.typography.titleMedium)
+            Text("${config?.type?.displayName ?: "Unknown"} ${config?.version ?: ""}")
+            Text("RAM: ${config?.ramMb ?: 0} MB")
+            Text("Max players: ${config?.maxPlayers ?: 20}")
+            Text("Java: ${config?.javaPort ?: 25565}  Â·  Bedrock: ${config?.bedrockPort ?: 19132}")
+            HorizontalDivider()
+            if (!running) {
+                Button(onClick = { onAction(ServerHostService.ACTION_START) }, modifier = Modifier.fillMaxWidth()) {
+                    Text("START SERVER")
+                }
+            } else {
+                TextButton(onClick = { onAction(ServerHostService.ACTION_STOP) }, modifier = Modifier.fillMaxWidth()) {
+                    Text("STOP SERVER")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TabContent(tab: DashboardTab, manager: ServerManager) {
+    var playerName by remember { mutableStateOf("") }
+    var propertyKey by remember { mutableStateOf("max-players") }
+    var propertyValue by remember { mutableStateOf(manager.config()?.maxPlayers?.toString() ?: "20") }
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Text(tab.title.uppercase(), style = MaterialTheme.typography.titleLarge)
+            when (tab) {
+                DashboardTab.OVERVIEW -> {
+                    Text("Server path: ${manager.storage.serverDir.absolutePath}")
+                    Text("Java runtime: ${manager.javaStatus()}")
+                    Text("Backups available: ${manager.listBackups().size}")
+                }
+                DashboardTab.CONSOLE -> {
+                    val logs = manager.recentLogs(80)
+                    if (logs.isEmpty()) Text("No server log output yet.")
+                    else logs.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+                }
+                DashboardTab.PLAYERS -> {
+                    Text(manager.playerSummary())
+                    OutlinedTextField(value = playerName, onValueChange = { playerName = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Player name") })
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        TextButton(onClick = { if (playerName.isNotBlank()) manager.whitelistAdd(playerName) }, enabled = manager.isRunning()) { Text("WHITELIST") }
+                        TextButton(onClick = { if (playerName.isNotBlank()) manager.whitelistRemove(playerName) }, enabled = manager.isRunning()) { Text("UNWHITELIST") }
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        TextButton(onClick = { if (playerName.isNotBlank()) manager.kickPlayer(playerName) }, enabled = manager.isRunning()) { Text("KICK") }
+                        TextButton(onClick = { if (playerName.isNotBlank()) manager.banPlayer(playerName) }, enabled = manager.isRunning()) { Text("BAN") }
+                        TextButton(onClick = { if (playerName.isNotBlank()) manager.pardonPlayer(playerName) }, enabled = manager.isRunning()) { Text("PARDON") }
+                    }
+                }
+                DashboardTab.WORLD -> {
+                    Text("World: ${manager.config()?.worldName ?: "world"}")
+                    Text("World directory: ${manager.storage.worldDir.absolutePath}")
+                }
+                DashboardTab.PLUGINS -> {
+                    val files = manager.pluginFiles()
+                    Text("Managed plugins: ${files.size}")
+                    files.forEach { Text(it.name, style = MaterialTheme.typography.bodySmall) }
+                }
+                DashboardTab.MODS -> {
+                    val files = manager.modFiles()
+                    Text("Installed mods: ${files.size}")
+                    files.forEach { Text(it.name, style = MaterialTheme.typography.bodySmall) }
+                }
+                DashboardTab.SETTINGS -> {
+                    Text("Settings write to the real server.properties used by the next server start.")
+                    OutlinedTextField(value = propertyKey, onValueChange = { propertyKey = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Property key") })
+                    OutlinedTextField(value = propertyValue, onValueChange = { propertyValue = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Property value") })
+                    Button(onClick = { runCatching { manager.setServerProperty(propertyKey.trim(), propertyValue) } }, modifier = Modifier.fillMaxWidth()) { Text("SAVE PROPERTY") }
+                    Text("Current world: ${manager.config()?.worldName ?: "world"}")
+                    Text("Current max players: ${manager.config()?.maxPlayers ?: 20}")
+                    Text("Loaded properties: ${manager.serverProperties().size}")
+                    manager.serverProperties().entries.take(20).forEach { (key, value) -> Text("$key=$value", style = MaterialTheme.typography.bodySmall) }
+                }
+                DashboardTab.NETWORK -> {
+                    var localtonet by remember { mutableStateOf(manager.localtonetConfig()) }
+                    var javaHost by remember { mutableStateOf(localtonet.javaHost) }
+                    var javaPort by remember { mutableStateOf(localtonet.javaPort.toString()) }
+                    var bedrockHost by remember { mutableStateOf(localtonet.bedrockHost) }
+                    var bedrockPort by remember { mutableStateOf(localtonet.bedrockPort.toString()) }
+                    val network = manager.networkStatus()
+
+                    Text("Localtonet public networking", style = MaterialTheme.typography.titleMedium)
+                    Text("Use the Localtonet Android client to keep one UDP/TCP tunnel running. MCSERVER continues to host Paper/Geyser locally.")
+                    Text("Local Java: 127.0.0.1:${manager.config()?.javaPort ?: 25565}")
+                    Text("Local Bedrock: 127.0.0.1:${manager.config()?.bedrockPort ?: 19132}")
+
+                    OutlinedTextField(
+                        value = javaHost,
+                        onValueChange = { javaHost = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Public Java host") }
+                    )
+                    OutlinedTextField(
+                        value = javaPort,
+                        onValueChange = { javaPort = it.filter(Char::isDigit) },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Public Java port") }
+                    )
+                    OutlinedTextField(
+                        value = bedrockHost,
+                        onValueChange = { bedrockHost = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Public Bedrock host") }
+                    )
+                    OutlinedTextField(
+                        value = bedrockPort,
+                        onValueChange = { bedrockPort = it.filter(Char::isDigit) },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("Public Bedrock port") }
+                    )
+
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                val saved = LocaltonetConfig(
+                                    enabled = true,
+                                    javaHost = javaHost.trim(),
+                                    javaPort = javaPort.toIntOrNull()?.coerceIn(1, 65535) ?: 25565,
+                                    bedrockHost = bedrockHost.trim(),
+                                    bedrockPort = bedrockPort.toIntOrNull()?.coerceIn(1, 65535) ?: 19132
+                                )
+                                manager.saveLocaltonet(saved)
+                                localtonet = saved
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("SAVE LOCALTONET")
+                        }
+                        TextButton(
+                            onClick = {
+                                val disabled = LocaltonetConfig()
+                                manager.saveLocaltonet(disabled)
+                                localtonet = disabled
+                                javaHost = ""
+                                javaPort = "25565"
+                                bedrockHost = ""
+                                bedrockPort = "19132"
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("DISABLE")
+                        }
+                    }
+
+                    Button(
+                        onClick = {
+                            runCatching {
+                                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https" + "://" + "localtonet.com/")))
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("OPEN LOCALTONET")
+                    }
+
+                    Text("Network status: ${network.message}")
+                    if (javaHost.isNotBlank()) Text("Java address: $javaHost:$javaPort")
+                    if (bedrockHost.isNotBlank()) Text("Bedrock address: $bedrockHost:$bedrockPort")
+                    Text("Keep the Localtonet Android client connected while the server is online.")
+                }
+                DashboardTab.BACKUPS -> {
+                    val backups = manager.listBackups()
+                    Text("Backups: ${backups.size}")
+                    backups.take(20).forEach { Text(it.name, style = MaterialTheme.typography.bodySmall) }
+                    TextButton(onClick = { manager.createBackup() }) { Text("CREATE BACKUP") }
+                }
+            }
+        }
+    }
+}

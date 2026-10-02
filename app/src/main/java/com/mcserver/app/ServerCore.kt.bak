@@ -1,0 +1,598 @@
+package com.mcserver.app
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.json.JSONObject
+import org.json.JSONArray
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.MessageDigest
+import java.util.Properties
+import java.util.concurrent.atomic.AtomicBoolean
+
+enum class ServerType(val displayName: String) {
+    VANILLA("Vanilla"),
+    PAPER("Paper"),
+    PURPUR("Purpur"),
+    SPIGOT("Spigot"),
+    BUKKIT("Bukkit-compatible"),
+    FABRIC("Fabric"),
+    FORGE("Forge"),
+    NEOFORGE("NeoForge"),
+    GEYSER("Geyser · Paper")
+}
+
+data class ServerConfig(
+    val name: String,
+    val version: String,
+    val type: ServerType,
+    val ramMb: Int,
+    val worldName: String,
+    val maxPlayers: Int = 20,
+    val javaPort: Int = 25565,
+    val bedrockPort: Int = 19132
+)
+
+data class NetworkStatus(
+    val connected: Boolean = false,
+    val publicHost: String = "",
+    val javaPort: Int = 0,
+    val bedrockPort: Int? = null,
+    val message: String = "Not connected"
+)
+
+data class DownloadResult(val file: File, val sha256: String)
+
+class StorageManager(context: Context) {
+    val root = File(context.filesDir, "app_data")
+    val serverDir = File(root, "servers/main")
+    val worldDir = File(serverDir, "world")
+    val pluginsDir = File(serverDir, "plugins")
+    val modsDir = File(serverDir, "mods")
+    val backupsDir = File(serverDir, "backups")
+    val logsDir = File(serverDir, "logs")
+    val runtimesDir = File(root, "runtimes")
+    val runtimeJava = File(runtimesDir, "current/bin/java")
+
+    fun initialize() {
+        listOf(serverDir, worldDir, pluginsDir, modsDir, backupsDir, logsDir, runtimesDir).forEach { it.mkdirs() }
+    }
+}
+
+class ConfigurationManager(private val storage: StorageManager) {
+    private val file = File(storage.serverDir, "server.properties.local")
+
+    fun save(config: ServerConfig) {
+        storage.initialize()
+        Properties().apply {
+            setProperty("name", config.name)
+            setProperty("version", config.version)
+            setProperty("type", config.type.name)
+            setProperty("ramMb", config.ramMb.toString())
+            setProperty("worldName", config.worldName)
+            setProperty("maxPlayers", config.maxPlayers.toString())
+            setProperty("javaPort", config.javaPort.toString())
+            setProperty("bedrockPort", config.bedrockPort.toString())
+            FileOutputStream(file).use { store(it, "MCSERVER configuration") }
+        }
+    }
+
+    fun load(): ServerConfig? {
+        if (!file.exists()) return null
+        val p = Properties()
+        FileInputStream(file).use { p.load(it) }
+        return ServerConfig(
+            name = p.getProperty("name", "My Server"),
+            version = p.getProperty("version", "latest"),
+            type = runCatching { ServerType.valueOf(p.getProperty("type", "PAPER")) }.getOrDefault(ServerType.PAPER),
+            ramMb = p.getProperty("ramMb", "1024").toIntOrNull() ?: 1024,
+            worldName = p.getProperty("worldName", "world"),
+            maxPlayers = p.getProperty("maxPlayers", "20").toIntOrNull() ?: 20,
+            javaPort = p.getProperty("javaPort", "25565").toIntOrNull() ?: 25565,
+            bedrockPort = p.getProperty("bedrockPort", "19132").toIntOrNull() ?: 19132
+        )
+    }
+}
+
+class DownloadManager(private val storage: StorageManager) {
+    private val client = OkHttpClient()
+
+    fun download(url: String, destination: File, expectedSha256: String? = null): DownloadResult {
+        destination.parentFile?.mkdirs()
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", "MCSERVER/0.1 (+https://example.invalid/mcserver)")
+            .build()
+        client.newCall(request).execute().use { response ->
+            check(response.isSuccessful) { "Download failed: HTTP ${response.code}" }
+            val body = response.body ?: error("Empty download response")
+            body.byteStream().use { input ->
+                FileOutputStream(destination).use { output -> input.copyTo(output) }
+            }
+        }
+        val actual = sha256Hex(destination)
+        if (expectedSha256 != null) {
+            check(actual.equals(expectedSha256, ignoreCase = true)) { "SHA-256 mismatch for ${destination.name}" }
+        }
+        return DownloadResult(destination, actual)
+    }
+
+    fun downloadRaw(url: String, destination: File): DownloadResult {
+        destination.parentFile?.mkdirs()
+        val connection = URL(url).openConnection() as HttpURLConnection
+        connection.requestMethod = "GET"
+        connection.setRequestProperty("User-Agent", "MCSERVER/0.1")
+        connection.connectTimeout = 20_000
+        connection.readTimeout = 120_000
+        connection.connect()
+        check(connection.responseCode in 200..399) { "Download failed: HTTP ${connection.responseCode}" }
+        connection.inputStream.use { input -> FileOutputStream(destination).use { output -> input.copyTo(output) } }
+        return DownloadResult(destination, sha256Hex(destination))
+    }
+
+    fun downloadSha512(url: String, destination: File, expectedSha512: String) {
+        destination.parentFile?.mkdirs()
+        val temp = File(destination.parentFile, destination.name + ".part")
+        val request = Request.Builder().url(url).header("User-Agent", "MCSERVER/0.1").build()
+        client.newCall(request).execute().use { response ->
+            check(response.isSuccessful) { "Download failed: HTTP ${response.code}" }
+            val body = response.body ?: error("Empty download response")
+            FileOutputStream(temp).use { output -> body.byteStream().use { input -> input.copyTo(output) } }
+        }
+        val digest = MessageDigest.getInstance("SHA-512")
+        FileInputStream(temp).use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        val actual = digest.digest().joinToString("") { "%02x".format(it) }
+        check(actual.equals(expectedSha512, ignoreCase = true)) { "SHA-512 mismatch for ${destination.name}" }
+        if (destination.exists()) check(destination.delete()) { "Unable to replace ${destination.name}" }
+        check(temp.renameTo(destination)) { "Unable to finalize ${destination.name}" }
+    }
+
+    companion object {
+        fun sha256Hex(file: File): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+            FileInputStream(file).use { input ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    digest.update(buffer, 0, read)
+                }
+            }
+            return digest.digest().joinToString("") { "%02x".format(it) }
+        }
+    }
+}
+
+class JavaManager(private val storage: StorageManager) {
+    fun executable(): File {
+        storage.initialize()
+        check(storage.runtimeJava.exists() && storage.runtimeJava.canExecute()) {
+            "No Android-compatible Java runtime is installed at ${storage.runtimeJava.absolutePath}."
+        }
+        return storage.runtimeJava
+    }
+}
+
+interface ServerProvider {
+    val type: ServerType
+    fun install(config: ServerConfig): File
+    fun prepare(config: ServerConfig) {}
+    fun extraArgs(config: ServerConfig): List<String> = emptyList()
+}
+
+class PaperProvider(
+    private val storage: StorageManager,
+    private val downloads: DownloadManager
+) : ServerProvider {
+    override val type = ServerType.PAPER
+
+    override fun install(config: ServerConfig): File {
+        val jar = File(storage.serverDir, "server.jar")
+        if (jar.exists() && jar.length() > 0) return jar
+
+        val apiUrl = "https://" + "fill.papermc.io/v3/projects/paper/versions/${config.version}/builds"
+        val builds = JSONArray(URL(apiUrl).readText())
+        var selectedUrl: String? = null
+
+        for (i in 0 until builds.length()) {
+            val build = builds.getJSONObject(i)
+            if (build.optString("channel") != "STABLE") continue
+            val serverKey = "server" + ":" + "default"
+            val url = build.optJSONObject("downloads")
+                ?.optJSONObject(serverKey)
+                ?.optString("url")
+            if (!url.isNullOrBlank()) {
+                selectedUrl = url
+                break
+            }
+        }
+
+        check(selectedUrl != null) {
+            "No stable Paper build exists for Minecraft ${config.version}."
+        }
+        downloads.download(selectedUrl, jar)
+        return jar
+    }
+
+    override fun prepare(config: ServerConfig) {
+        val properties = File(storage.serverDir, "server.properties")
+        setProperty(properties, "server-port", config.javaPort.toString())
+        setProperty(properties, "max-players", config.maxPlayers.toString())
+        setProperty(properties, "level-name", config.worldName)
+    }
+
+    private fun setProperty(file: File, key: String, value: String) {
+        val p = Properties()
+        if (file.exists()) FileInputStream(file).use { p.load(it) }
+        p.setProperty(key, value)
+        FileOutputStream(file).use { p.store(it, null) }
+    }
+}
+
+class GeyserManager(
+    private val storage: StorageManager,
+    private val downloads: DownloadManager
+) {
+    data class Resolved(
+        val versionId: String,
+        val versionName: String,
+        val fileName: String,
+        val sha512: String,
+        val downloadUrl: String
+    )
+
+    fun resolveCompatibleVersion(minecraftVersion: String): Resolved {
+        val gameVersions = URLEncoder.encode("[\"" + minecraftVersion + "\"]", Charsets.UTF_8.name())
+        val loaders = URLEncoder.encode("[\"paper\"]", Charsets.UTF_8.name())
+        val apiUrl = "https://" + "api.modrinth.com/v2/project/wKkoqHrH/version?game_versions=$gameVersions&loaders=$loaders"
+        val versions = JSONArray(URL(apiUrl).readText())
+
+        for (i in 0 until versions.length()) {
+            val entry = versions.getJSONObject(i)
+            if (entry.optString("status") != "listed") continue
+
+            val files = entry.optJSONArray("files") ?: continue
+            var selected: JSONObject? = null
+            for (j in 0 until files.length()) {
+                val candidate = files.getJSONObject(j)
+                if (!candidate.optString("filename").equals("Geyser-Spigot.jar", true)) continue
+                if (selected == null || candidate.optBoolean("primary", false)) {
+                    selected = candidate
+                }
+                if (candidate.optBoolean("primary", false)) break
+            }
+
+            val file = selected ?: continue
+            val hashes = file.optJSONObject("hashes") ?: continue
+            val sha512 = hashes.optString("sha512")
+            val url = file.optString("url")
+            if (url.isNotBlank() && sha512.isNotBlank()) {
+                return Resolved(
+                    versionId = entry.getString("id"),
+                    versionName = entry.optString("version_number"),
+                    fileName = file.optString("filename", "Geyser-Spigot.jar"),
+                    sha512 = sha512,
+                    downloadUrl = url
+                )
+            }
+        }
+
+        error("Geyser unavailable for Minecraft $minecraftVersion. No listed Paper-compatible release was returned by Modrinth.")
+    }
+
+    fun installForPaper(minecraftVersion: String): Resolved {
+        val resolved = resolveCompatibleVersion(minecraftVersion)
+        storage.initialize()
+        val destination = File(storage.pluginsDir, resolved.fileName)
+        if (!destination.exists() || destination.length() == 0L) {
+            downloads.downloadSha512(resolved.downloadUrl, destination, resolved.sha512)
+        }
+        return resolved
+    }
+}
+
+class GeyserProvider(
+    private val paper: PaperProvider,
+    private val geyser: GeyserManager
+) : ServerProvider {
+    override val type = ServerType.GEYSER
+
+    override fun install(config: ServerConfig): File {
+        val jar = paper.install(config)
+        geyser.installForPaper(config.version)
+        return jar
+    }
+
+    override fun prepare(config: ServerConfig) = paper.prepare(config)
+}
+
+class CatalogProvider(
+    override val type: ServerType,
+    private val message: String
+) : ServerProvider {
+    override fun install(config: ServerConfig): File = error("$message (${config.version}).")
+}
+
+class ServerProviderManager(context: Context) {
+    private val storage = StorageManager(context)
+    private val downloads = DownloadManager(storage)
+    private val paper = PaperProvider(storage, downloads)
+    private val geyser = GeyserManager(storage, downloads)
+
+    private val providers: Map<ServerType, ServerProvider> = mapOf(
+        ServerType.PAPER to paper,
+        ServerType.GEYSER to GeyserProvider(paper, geyser),
+        ServerType.VANILLA to CatalogProvider(ServerType.VANILLA, "Mojang version-manifest installation adapter not enabled yet"),
+        ServerType.PURPUR to CatalogProvider(ServerType.PURPUR, "Purpur provider adapter not enabled yet"),
+        ServerType.SPIGOT to CatalogProvider(ServerType.SPIGOT, "Spigot BuildTools/provider adapter not enabled yet"),
+        ServerType.BUKKIT to CatalogProvider(ServerType.BUKKIT, "Bukkit-compatible provider adapter not enabled yet"),
+        ServerType.FABRIC to CatalogProvider(ServerType.FABRIC, "Fabric installer adapter not enabled yet"),
+        ServerType.FORGE to CatalogProvider(ServerType.FORGE, "Forge installer adapter not enabled yet"),
+        ServerType.NEOFORGE to CatalogProvider(ServerType.NEOFORGE, "NeoForge installer adapter not enabled yet")
+    )
+
+    fun provider(type: ServerType): ServerProvider =
+        providers[type] ?: error("Unsupported server type: $type")
+}
+
+
+class ProcessManager(private val storage: StorageManager, private val java: JavaManager) {
+    private val running = AtomicBoolean(false)
+    private var process: Process? = null
+
+    fun start(config: ServerConfig, jar: File, onLog: (String) -> Unit): Boolean {
+        check(running.compareAndSet(false, true)) { "A Minecraft process is already running." }
+        return try {
+            storage.initialize()
+            val command = mutableListOf(
+                java.executable().absolutePath,
+                "-Xms${config.ramMb}M",
+                "-Xmx${config.ramMb}M",
+                "-jar",
+                jar.name,
+                "nogui"
+            )
+            process = ProcessBuilder(command)
+                .directory(storage.serverDir)
+                .redirectErrorStream(true)
+                .start()
+            val p = process!!
+            Thread {
+                p.inputStream.bufferedReader().useLines { lines ->
+                    lines.forEach { onLog(it) }
+                }
+            }.start()
+            Thread {
+                p.waitFor()
+                process = null
+                running.set(false)
+            }.start()
+            true
+        } catch (t: Throwable) {
+            process = null
+            running.set(false)
+            throw t
+        }
+    }
+
+    fun stop(force: Boolean = false) {
+        val p = process ?: return
+        if (force) p.destroyForcibly() else p.destroy()
+    }
+
+    fun send(command: String) {
+        process?.outputStream?.bufferedWriter()?.use { writer ->
+            writer.write(command)
+            writer.newLine()
+            writer.flush()
+        }
+    }
+
+    fun isRunning(): Boolean = running.get()
+}
+
+class ServerManager(context: Context) {
+    val storage = StorageManager(context)
+    private val configuration = ConfigurationManager(storage)
+    private val providers = ServerProviderManager(context)
+    private val java = JavaManager(storage)
+    private val process = ProcessManager(storage, java)
+
+    fun create(config: ServerConfig) {
+        storage.initialize()
+        check(!process.isRunning()) { "Stop the current server before replacing it." }
+        configuration.save(config)
+    }
+
+    fun config(): ServerConfig? = configuration.load()
+
+    fun install(config: ServerConfig = config() ?: error("Create a server first.")): File {
+        storage.initialize()
+        val provider = providers.provider(config.type)
+        val jar = provider.install(config)
+        provider.prepare(config)
+        return jar
+    }
+
+    fun start(config: ServerConfig, onLog: (String) -> Unit): Boolean {
+        val jar = File(storage.serverDir, "server.jar")
+        check(jar.exists()) { "Server jar is not installed yet." }
+        providers.provider(config.type).prepare(config)
+        return process.start(config, jar, onLog)
+    }
+
+    fun start(onLog: (String) -> Unit): Boolean {
+        val config = config() ?: error("Create a server first.")
+        val jar = install(config)
+        return process.start(config, jar, onLog)
+    }
+
+    fun stop(force: Boolean = false) = process.stop(force)
+    fun sendCommand(command: String) = process.send(command)
+    fun isRunning(): Boolean = process.isRunning()
+    fun loadConfig(): ServerConfig = config() ?: error("Create a server first.")
+
+    fun javaStatus(): String = runCatching {
+        java.executable().absolutePath
+    }.getOrElse { it.message ?: "Android-compatible Java runtime not installed" }
+
+    fun recentLogs(): List<String> = emptyList()
+
+    fun playerSummary(): String = if (isRunning()) {
+        "Live player query is not connected yet."
+    } else {
+        "Server offline."
+    }
+
+    fun networkStatus(): NetworkStatus =
+        NetworkStatus(message = "Tunnel control is not connected yet.")
+
+    fun listBackups(): List<File> =
+        storage.backupsDir.listFiles()
+            ?.filter { it.isDirectory }
+            ?.sortedByDescending { it.name }
+            ?: emptyList()
+}
+
+
+class NetworkManager(private val context: Context) {
+    @Volatile var status = NetworkStatus(message = "No tunnel registration yet")
+        private set
+
+    fun setStatus(value: NetworkStatus) { status = value }
+}
+
+class AppRepository(context: Context) {
+    val serverManager = ServerManager(context)
+    val networkManager = NetworkManager(context)
+    val logs = ArrayDeque<String>(500)
+
+    @Synchronized
+    fun appendLog(line: String) {
+        if (logs.size >= 500) logs.removeFirst()
+        logs.addLast(line)
+    }
+}
+
+class RenderApiClient(
+    private val baseUrl: String,
+    private val token: String
+) {
+    private val client = OkHttpClient()
+
+    fun health(): Boolean {
+        if (baseUrl.isBlank()) return false
+        val request = Request.Builder()
+            .url(baseUrl.trimEnd('/') + "/health")
+            .header("Authorization", "Bearer $token")
+            .build()
+        return runCatching { client.newCall(request).execute().use { it.isSuccessful } }.getOrDefault(false)
+    }
+}
+
+class TunnelClient(private val baseUrl: String, private val token: String) {
+    fun isConfigured(): Boolean = baseUrl.isNotBlank() && token.isNotBlank()
+}
+
+class BackupManager(private val storage: StorageManager) {
+    fun createBackup(): File {
+        storage.backupsDir.mkdirs()
+        val target = File(storage.backupsDir, "backup-${System.currentTimeMillis()}")
+        copyDirectory(storage.serverDir, target)
+        return target
+    }
+
+    private fun copyDirectory(source: File, target: File) {
+        source.listFiles().orEmpty().forEach { child ->
+            val destination = File(target, child.name)
+            if (child.isDirectory) {
+                destination.mkdirs()
+                copyDirectory(child, destination)
+            } else {
+                destination.parentFile?.mkdirs()
+                child.copyTo(destination, overwrite = false)
+            }
+        }
+    }
+}
+
+class ServerHostService : Service() {
+    companion object {
+        const val ACTION_START = "com.mcserver.app.START"
+        const val ACTION_STOP = "com.mcserver.app.STOP"
+        const val ACTION_RESTART = "com.mcserver.app.RESTART"
+        const val ACTION_FORCE_STOP = "com.mcserver.app.FORCE_STOP"
+        private const val CHANNEL_ID = "mcserver_host"
+        private const val NOTIFICATION_ID = 4001
+    }
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private lateinit var repository: AppRepository
+
+    override fun onCreate() {
+        super.onCreate()
+        repository = AppRepository(this)
+        createChannel()
+        startForeground(NOTIFICATION_ID, notification("MCSERVER host ready"))
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_START -> scope.launch { runCatching { repository.serverManager.start { repository.appendLog(it) } }.onFailure { repository.appendLog("START ERROR: ${it.message}") } }
+            ACTION_STOP -> scope.launch { repository.serverManager.stop(false) }
+            ACTION_FORCE_STOP -> scope.launch { repository.serverManager.stop(true) }
+            ACTION_RESTART -> scope.launch {
+                repository.serverManager.stop(false)
+                Thread.sleep(800)
+                runCatching { repository.serverManager.start { repository.appendLog(it) } }.onFailure { repository.appendLog("RESTART ERROR: ${it.message}") }
+            }
+        }
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        repository.serverManager.stop(true)
+        scope.cancel()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Minecraft server", NotificationManager.IMPORTANCE_LOW))
+        }
+    }
+
+    private fun notification(text: String): Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+        .setContentTitle("MCSERVER")
+        .setContentText(text)
+        .setSmallIcon(android.R.drawable.stat_sys_download_done)
+        .setOngoing(true)
+        .build()
+}
+

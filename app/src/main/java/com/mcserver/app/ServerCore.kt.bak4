@@ -1,0 +1,1043 @@
+package com.mcserver.app
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.BufferedWriter
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.charset.StandardCharsets
+import java.net.Socket as NetSocket
+import java.net.InetSocketAddress as NetInetSocketAddress
+import java.security.MessageDigest
+import java.util.Properties
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+
+enum class ServerType(val displayName: String) {
+    VANILLA("Vanilla"),
+    PAPER("Paper"),
+    PURPUR("Purpur"),
+    SPIGOT("Spigot"),
+    BUKKIT("Bukkit-compatible"),
+    FABRIC("Fabric"),
+    FORGE("Forge"),
+    NEOFORGE("NeoForge"),
+    GEYSER("Geyser · Paper")
+}
+
+data class ServerConfig(
+    val name: String,
+    val version: String,
+    val type: ServerType,
+    val ramMb: Int,
+    val worldName: String,
+    val maxPlayers: Int = 20,
+    val javaPort: Int = 25565,
+    val bedrockPort: Int = 19132
+)
+
+data class NetworkStatus(
+    val connected: Boolean = false,
+    val publicHost: String = "",
+    val javaPort: Int = 0,
+    val bedrockPort: Int? = null,
+    val message: String = "Not connected"
+)
+
+data class LocaltonetConfig(
+    val enabled: Boolean = false,
+    val javaHost: String = "",
+    val javaPort: Int = 25565,
+    val bedrockHost: String = "",
+    val bedrockPort: Int = 19132
+)
+
+data class DownloadResult(val file: File, val sha256: String)
+
+class StorageManager(context: Context) {
+    val root = File(context.filesDir, "app_data")
+    val serverDir = File(root, "servers/main")
+    val worldDir = File(serverDir, "world")
+    val pluginsDir = File(serverDir, "plugins")
+    val modsDir = File(serverDir, "mods")
+    val backupsDir = File(serverDir, "backups")
+    val logsDir = File(serverDir, "logs")
+    val runtimesDir = File(root, "runtimes")
+    val runtimeJava = File(runtimesDir, "current/bin/java")
+
+    fun initialize() {
+        listOf(serverDir, worldDir, pluginsDir, modsDir, backupsDir, logsDir, runtimesDir).forEach(File::mkdirs)
+    }
+
+    fun logFile(): File = File(logsDir, "server.log")
+    fun eulaFile(): File = File(serverDir, "eula.txt")
+}
+
+class ConfigurationManager(private val storage: StorageManager) {
+    private val file = File(storage.serverDir, "server.properties.local")
+    private val localtonetFile = File(storage.serverDir, "localtonet.properties.local")
+
+    fun save(config: ServerConfig) {
+        storage.initialize()
+        Properties().apply {
+            setProperty("name", config.name)
+            setProperty("version", config.version)
+            setProperty("type", config.type.name)
+            setProperty("ramMb", config.ramMb.toString())
+            setProperty("worldName", config.worldName)
+            setProperty("maxPlayers", config.maxPlayers.toString())
+            setProperty("javaPort", config.javaPort.toString())
+            setProperty("bedrockPort", config.bedrockPort.toString())
+            FileOutputStream(file).use { store(it, "MCSERVER configuration") }
+        }
+    }
+
+    fun load(): ServerConfig? {
+        if (!file.exists()) return null
+        val p = Properties()
+        FileInputStream(file).use { p.load(it) }
+        return ServerConfig(
+            name = p.getProperty("name", "My Server"),
+            version = p.getProperty("version", "1.21.10"),
+            type = runCatching { ServerType.valueOf(p.getProperty("type", ServerType.PAPER.name)) }.getOrDefault(ServerType.PAPER),
+            ramMb = p.getProperty("ramMb", "1024").toIntOrNull()?.coerceAtLeast(512) ?: 1024,
+            worldName = p.getProperty("worldName", "world").ifBlank { "world" },
+            maxPlayers = p.getProperty("maxPlayers", "20").toIntOrNull()?.coerceIn(1, 1000) ?: 20,
+            javaPort = p.getProperty("javaPort", "25565").toIntOrNull()?.coerceIn(1, 65535) ?: 25565,
+            bedrockPort = p.getProperty("bedrockPort", "19132").toIntOrNull()?.coerceIn(1, 65535) ?: 19132
+        )
+    }
+
+    fun saveLocaltonet(config: LocaltonetConfig) {
+        storage.initialize()
+        Properties().apply {
+            setProperty("enabled", config.enabled.toString())
+            setProperty("javaHost", config.javaHost.trim())
+            setProperty("javaPort", config.javaPort.coerceIn(1, 65535).toString())
+            setProperty("bedrockHost", config.bedrockHost.trim())
+            setProperty("bedrockPort", config.bedrockPort.coerceIn(1, 65535).toString())
+            FileOutputStream(localtonetFile).use { store(it, "MCSERVER Localtonet configuration") }
+        }
+    }
+
+    fun loadLocaltonet(): LocaltonetConfig {
+        if (!localtonetFile.exists()) return LocaltonetConfig()
+        val p = Properties()
+        FileInputStream(localtonetFile).use { p.load(it) }
+        return LocaltonetConfig(
+            enabled = p.getProperty("enabled", "false").toBoolean(),
+            javaHost = p.getProperty("javaHost", "").trim(),
+            javaPort = p.getProperty("javaPort", "25565").toIntOrNull()?.coerceIn(1, 65535) ?: 25565,
+            bedrockHost = p.getProperty("bedrockHost", "").trim(),
+            bedrockPort = p.getProperty("bedrockPort", "19132").toIntOrNull()?.coerceIn(1, 65535) ?: 19132
+        )
+    }
+}
+
+class DownloadManager(private val storage: StorageManager) {
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
+        .build()
+
+    fun download(url: String, destination: File, expectedSha256: String? = null): DownloadResult {
+        destination.parentFile?.mkdirs()
+        val temporary = File(destination.parentFile ?: storage.serverDir, destination.name + ".part")
+        val request = Request.Builder().url(url).header("User-Agent", "MCSERVER/0.1").build()
+        client.newCall(request).execute().use { response ->
+            check(response.isSuccessful) { "Download failed: HTTP ${response.code}" }
+            val body = response.body ?: error("Empty download response")
+            FileOutputStream(temporary).use { output -> body.byteStream().use { input -> input.copyTo(output) } }
+        }
+        val actual = sha256Hex(temporary)
+        if (expectedSha256 != null) check(actual.equals(expectedSha256, ignoreCase = true)) { "SHA-256 mismatch for ${destination.name}" }
+        if (destination.exists()) check(destination.delete()) { "Unable to replace ${destination.name}" }
+        check(temporary.renameTo(destination)) { "Unable to finalize ${destination.name}" }
+        return DownloadResult(destination, actual)
+    }
+
+    fun downloadRaw(url: String, destination: File): DownloadResult {
+        destination.parentFile?.mkdirs()
+        val connection = URL(url).openConnection() as HttpURLConnection
+        try {
+            connection.requestMethod = "GET"
+            connection.setRequestProperty("User-Agent", "MCSERVER/0.1")
+            connection.connectTimeout = 20_000
+            connection.readTimeout = 120_000
+            connection.connect()
+            check(connection.responseCode in 200..399) { "Download failed: HTTP ${connection.responseCode}" }
+            val temporary = File(destination.parentFile ?: storage.serverDir, destination.name + ".part")
+            connection.inputStream.use { input -> FileOutputStream(temporary).use { output -> input.copyTo(output) } }
+            if (destination.exists()) check(destination.delete()) { "Unable to replace ${destination.name}" }
+            check(temporary.renameTo(destination)) { "Unable to finalize ${destination.name}" }
+            return DownloadResult(destination, sha256Hex(destination))
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun downloadSha512(url: String, destination: File, expectedSha512: String) {
+        destination.parentFile?.mkdirs()
+        val temporary = File(destination.parentFile ?: storage.serverDir, destination.name + ".part")
+        val request = Request.Builder().url(url).header("User-Agent", "MCSERVER/0.1").build()
+        client.newCall(request).execute().use { response ->
+            check(response.isSuccessful) { "Download failed: HTTP ${response.code}" }
+            val body = response.body ?: error("Empty download response")
+            FileOutputStream(temporary).use { output -> body.byteStream().use { input -> input.copyTo(output) } }
+        }
+        val digest = MessageDigest.getInstance("SHA-512")
+        FileInputStream(temporary).use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        val actual = digest.digest().joinToString("") { "%02x".format(it) }
+        check(actual.equals(expectedSha512, ignoreCase = true)) { "SHA-512 mismatch for ${destination.name}" }
+        if (destination.exists()) check(destination.delete()) { "Unable to replace ${destination.name}" }
+        check(temporary.renameTo(destination)) { "Unable to finalize ${destination.name}" }
+    }
+
+    companion object {
+        fun sha256Hex(file: File): String {
+            val digest = MessageDigest.getInstance("SHA-256")
+            FileInputStream(file).use { input ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    digest.update(buffer, 0, read)
+                }
+            }
+            return digest.digest().joinToString("") { "%02x".format(it) }
+        }
+    }
+}
+
+class JavaManager(private val context: Context, private val storage: StorageManager) {
+    companion object {
+        private const val RUNTIME_ASSET = "jre21-arm64-20240309-release.tar.xz"
+    }
+
+    fun executable(): File {
+        storage.initialize()
+        check(storage.runtimeJava.exists() && storage.runtimeJava.canExecute()) {
+            "No Android-compatible Java runtime is installed at ${storage.runtimeJava.absolutePath}."
+        }
+        return storage.runtimeJava
+    }
+
+    fun ensureInstalled(onLog: (String) -> Unit = {}): File {
+        storage.initialize()
+        if (storage.runtimeJava.exists() && storage.runtimeJava.canExecute()) return storage.runtimeJava
+
+        val supported = Build.SUPPORTED_ABIS.any { it == "arm64-v8a" }
+        check(supported) { "This build currently requires an ARM64 Android device." }
+
+        val tempRoot = File(storage.runtimesDir, "current.installing")
+        if (tempRoot.exists()) tempRoot.deleteRecursively()
+        check(tempRoot.mkdirs()) { "Unable to create Java runtime staging directory." }
+
+        onLog("Android Java 21 runtime is missing. Installing bundled runtime...")
+        context.assets.open(RUNTIME_ASSET).use { assetInput ->
+            XZCompressorInputStream(assetInput).use { xzInput ->
+                TarArchiveInputStream(xzInput).use { tar ->
+                    while (true) {
+                        val entry = tar.nextTarEntry ?: break
+                        val normalized = entry.name.removePrefix("./")
+                        if (normalized.isBlank() || normalized.startsWith("../") || normalized.contains("/../") || normalized.startsWith("/")) continue
+                        val target = File(tempRoot, normalized)
+                        if (entry.isDirectory) {
+                            check(target.mkdirs() || target.isDirectory) { "Unable to create runtime directory ${entry.name}" }
+                        } else {
+                            target.parentFile?.mkdirs()
+                            FileOutputStream(target, false).use { output -> tar.copyTo(output) }
+                            if (normalized == "bin/java") check(target.setExecutable(true, false)) { "Unable to make Java executable." }
+                        }
+                    }
+                }
+            }
+        }
+
+        val stagedJava = File(tempRoot, "bin/java")
+        check(stagedJava.isFile) { "Bundled Java runtime does not contain bin/java." }
+        val current = storage.runtimesDir.resolve("current")
+        if (current.exists()) current.deleteRecursively()
+        check(tempRoot.renameTo(current)) { "Unable to activate Java runtime." }
+        val executable = storage.runtimeJava
+        check(executable.exists() && executable.setExecutable(true, false)) { "Installed Java runtime is not executable." }
+        onLog("Java 21 Android runtime installed successfully.")
+        return executable
+    }
+}
+
+interface ServerProvider {
+    val type: ServerType
+    fun install(config: ServerConfig): File
+    fun prepare(config: ServerConfig) {}
+    fun extraArgs(config: ServerConfig): List<String> = emptyList()
+}
+
+class PaperProvider(
+    private val storage: StorageManager,
+    private val downloads: DownloadManager
+) : ServerProvider {
+    override val type = ServerType.PAPER
+
+    override fun install(config: ServerConfig): File {
+        storage.initialize()
+        val jar = File(storage.serverDir, "server.jar")
+        if (jar.exists() && jar.length() > 0L) return jar
+        val apiUrl = "https://" + "fill.papermc.io/v3/projects/paper/versions/${config.version}/builds"
+        val builds = JSONArray(URL(apiUrl).readText())
+        var selectedUrl: String? = null
+        for (i in 0 until builds.length()) {
+            val build = builds.getJSONObject(i)
+            if (build.optString("channel") != "STABLE") continue
+            val downloadsJson = build.optJSONObject("downloads") ?: continue
+            val serverKey = "server" + ":" + "default"
+            val url = downloadsJson.optJSONObject(serverKey)?.optString("url")
+            if (!url.isNullOrBlank()) {
+                selectedUrl = url
+                break
+            }
+        }
+        check(selectedUrl != null) { "No stable Paper build exists for Minecraft ${config.version}." }
+        downloads.download(selectedUrl, jar)
+        return jar
+    }
+
+    override fun prepare(config: ServerConfig) {
+        val properties = File(storage.serverDir, "server.properties")
+        setProperty(properties, "server-port", config.javaPort.toString())
+        setProperty(properties, "max-players", config.maxPlayers.toString())
+        setProperty(properties, "level-name", config.worldName)
+        setProperty(properties, "online-mode", "true")
+        setProperty(properties, "enable-command-block", "true")
+    }
+
+    private fun setProperty(file: File, key: String, value: String) {
+        val p = Properties()
+        if (file.exists()) FileInputStream(file).use { p.load(it) }
+        p.setProperty(key, value)
+        FileOutputStream(file).use { p.store(it, null) }
+    }
+}
+
+class GeyserManager(
+    private val storage: StorageManager,
+    private val downloads: DownloadManager
+) {
+    data class Resolved(
+        val versionId: String,
+        val versionName: String,
+        val fileName: String,
+        val sha512: String,
+        val downloadUrl: String
+    )
+
+    fun resolveCompatibleVersion(minecraftVersion: String): Resolved {
+        val gameVersions = java.net.URLEncoder.encode("[\"$minecraftVersion\"]", StandardCharsets.UTF_8.name())
+        val loaders = java.net.URLEncoder.encode("[\"paper\"]", StandardCharsets.UTF_8.name())
+        val apiUrl = "https://" + "api.modrinth.com/v2/project/geyser/version?game_versions=$gameVersions&loaders=$loaders"
+        val versions = JSONArray(URL(apiUrl).readText())
+        for (i in 0 until versions.length()) {
+            val entry = versions.getJSONObject(i)
+            if (entry.optString("status") != "listed") continue
+            val files = entry.optJSONArray("files") ?: continue
+            var selected: JSONObject? = null
+            for (j in 0 until files.length()) {
+                val candidate = files.getJSONObject(j)
+                if (!candidate.optString("filename").equals("Geyser-Spigot.jar", ignoreCase = true)) continue
+                selected = candidate
+                if (candidate.optBoolean("primary", false)) break
+            }
+            val file = selected ?: continue
+            val hashes = file.optJSONObject("hashes") ?: continue
+            val sha512 = hashes.optString("sha512")
+            val url = file.optString("url")
+            if (sha512.isNotBlank() && url.isNotBlank()) {
+                return Resolved(
+                    versionId = entry.getString("id"),
+                    versionName = entry.optString("version_number"),
+                    fileName = file.optString("filename", "Geyser-Spigot.jar"),
+                    sha512 = sha512,
+                    downloadUrl = url
+                )
+            }
+        }
+        error("Geyser unavailable for Minecraft $minecraftVersion. No listed Paper-compatible release was returned by Modrinth.")
+    }
+
+    fun installForPaper(minecraftVersion: String): Resolved {
+        val resolved = resolveCompatibleVersion(minecraftVersion)
+        storage.initialize()
+        val destination = File(storage.pluginsDir, resolved.fileName)
+        if (!destination.exists() || destination.length() == 0L) {
+            downloads.downloadSha512(resolved.downloadUrl, destination, resolved.sha512)
+        }
+        return resolved
+    }
+}
+
+class GeyserProvider(
+    private val paper: PaperProvider,
+    private val geyser: GeyserManager
+) : ServerProvider {
+    override val type = ServerType.GEYSER
+
+    override fun install(config: ServerConfig): File {
+        val jar = paper.install(config)
+        geyser.installForPaper(config.version)
+        return jar
+    }
+
+    override fun prepare(config: ServerConfig) = paper.prepare(config)
+}
+
+class CatalogProvider(
+    override val type: ServerType,
+    private val message: String
+) : ServerProvider {
+    override fun install(config: ServerConfig): File = error("$message (${config.version}).")
+}
+
+class ServerProviderManager(context: Context) {
+    private val storage = StorageManager(context)
+    private val downloads = DownloadManager(storage)
+    private val paper = PaperProvider(storage, downloads)
+    private val geyser = GeyserManager(storage, downloads)
+
+    private val providers: Map<ServerType, ServerProvider> = mapOf(
+        ServerType.PAPER to paper,
+        ServerType.GEYSER to GeyserProvider(paper, geyser),
+        ServerType.VANILLA to CatalogProvider(ServerType.VANILLA, "Mojang version-manifest installation adapter not enabled yet"),
+        ServerType.PURPUR to CatalogProvider(ServerType.PURPUR, "Purpur provider adapter not enabled yet"),
+        ServerType.SPIGOT to CatalogProvider(ServerType.SPIGOT, "Spigot provider adapter not enabled yet"),
+        ServerType.BUKKIT to CatalogProvider(ServerType.BUKKIT, "Bukkit provider adapter not enabled yet"),
+        ServerType.FABRIC to CatalogProvider(ServerType.FABRIC, "Fabric installer adapter not enabled yet"),
+        ServerType.FORGE to CatalogProvider(ServerType.FORGE, "Forge installer adapter not enabled yet"),
+        ServerType.NEOFORGE to CatalogProvider(ServerType.NEOFORGE, "NeoForge installer adapter not enabled yet")
+    )
+
+    fun provider(type: ServerType): ServerProvider = providers[type] ?: error("Unsupported server type: $type")
+}
+
+class ProcessManager(private val storage: StorageManager, private val java: JavaManager) {
+    private val running = AtomicBoolean(false)
+    private val stateLock = Any()
+    @Volatile private var process: Process? = null
+    @Volatile private var writer: BufferedWriter? = null
+
+    fun start(config: ServerConfig, jar: File, args: List<String>, onLog: (String) -> Unit): Boolean {
+        synchronized(stateLock) {
+            check(!running.get()) { "A Minecraft process is already running." }
+            check(jar.exists() && jar.length() > 0L) { "Server jar is missing or empty." }
+            storage.initialize()
+            val javaExecutable = java.ensureInstalled(onLog)
+            val command = mutableListOf(
+                javaExecutable.absolutePath,
+                "-Xms${config.ramMb}M",
+                "-Xmx${config.ramMb}M",
+                "-jar",
+                jar.name
+            )
+            command += args
+            command += "nogui"
+            return try {
+                val started = ProcessBuilder(command)
+                    .directory(storage.serverDir)
+                    .redirectErrorStream(true)
+                    .start()
+                process = started
+                writer = BufferedWriter(OutputStreamWriter(started.outputStream, StandardCharsets.UTF_8))
+                running.set(true)
+
+                Thread {
+                    runCatching {
+                        started.inputStream.bufferedReader(StandardCharsets.UTF_8).useLines { lines ->
+                            lines.forEach { line ->
+                                appendLog(line)
+                                onLog(line)
+                            }
+                        }
+                    }
+                }.apply { name = "MCSERVER-log" }.start()
+
+                Thread {
+                    val exitCode = runCatching { started.waitFor() }.getOrDefault(-1)
+                    synchronized(stateLock) {
+                        runCatching { writer?.close() }
+                        writer = null
+                        process = null
+                        running.set(false)
+                    }
+                    appendLog("Process exited with code $exitCode")
+                }.apply { name = "MCSERVER-wait" }.start()
+                true
+            } catch (t: Throwable) {
+                writer = null
+                process = null
+                running.set(false)
+                throw t
+            }
+        }
+    }
+
+    fun stop(force: Boolean = false) {
+        val current = synchronized(stateLock) { process } ?: return
+        if (!force) {
+            runCatching { send("stop") }
+            if (!current.waitFor(15, TimeUnit.SECONDS)) current.destroy()
+            if (current.isAlive) current.destroyForcibly()
+        } else {
+            current.destroyForcibly()
+            current.waitFor(5, TimeUnit.SECONDS)
+        }
+        synchronized(stateLock) {
+            runCatching { writer?.close() }
+            writer = null
+            process = null
+            running.set(false)
+        }
+    }
+
+    fun send(command: String) {
+        val currentWriter = writer ?: error("Minecraft server is not running.")
+        synchronized(stateLock) {
+            currentWriter.write(command.trim())
+            currentWriter.newLine()
+            currentWriter.flush()
+        }
+    }
+
+    fun isRunning(): Boolean = running.get()
+
+    private fun appendLog(line: String) {
+        storage.initialize()
+        FileOutputStream(storage.logFile(), true).use { output ->
+            output.write((line + System.lineSeparator()).toByteArray(StandardCharsets.UTF_8))
+        }
+    }
+}
+
+class ServerManager(context: Context) {
+    val storage = StorageManager(context)
+    private val configuration = ConfigurationManager(storage)
+    private val providers = ServerProviderManager(context)
+    private val java = JavaManager(context, storage)
+    private val process = ProcessManager(storage, java)
+    private val backups = BackupManager(storage)
+    private val tunnel = TunnelClient(BuildConfig.RENDER_BASE_URL, BuildConfig.RENDER_TUNNEL_TOKEN)
+    @Volatile private var network = NetworkStatus(message = "Public tunnel is not configured")
+
+    fun create(config: ServerConfig) {
+        storage.initialize()
+        check(!process.isRunning()) { "Stop the current server before replacing it." }
+        configuration.save(config)
+    }
+
+    fun eulaAccepted(): Boolean {
+        val file = storage.eulaFile()
+        if (!file.exists()) return false
+        return file.readLines(StandardCharsets.UTF_8).any { it.trim().equals("eula=true", ignoreCase = true) }
+    }
+
+    fun acceptEula() {
+        storage.initialize()
+        FileOutputStream(storage.eulaFile(), false).use { output ->
+            output.write("# Minecraft EULA accepted by the MCSERVER setup\neula=true\n".toByteArray(StandardCharsets.UTF_8))
+        }
+    }
+
+    fun config(): ServerConfig? = configuration.load()
+
+    fun localtonetConfig(): LocaltonetConfig = configuration.loadLocaltonet()
+
+    fun saveLocaltonet(config: LocaltonetConfig) {
+        configuration.saveLocaltonet(config)
+        network = if (config.enabled) {
+            NetworkStatus(
+                connected = false,
+                publicHost = config.javaHost,
+                javaPort = config.javaPort,
+                bedrockPort = config.bedrockPort,
+                message = if (config.javaHost.isNotBlank() || config.bedrockHost.isNotBlank()) {
+                    "Localtonet configured; start the TCP/UDP tunnel from the Localtonet dashboard"
+                } else {
+                    "Localtonet enabled; enter the public tunnel endpoints"
+                }
+            )
+        } else {
+            NetworkStatus(message = "Public tunnel is not configured")
+        }
+    }
+
+    fun availablePaperVersions(): List<String> {
+        val apiUrl = "https://" + "fill.papermc.io/v3/projects/paper"
+        val root = JSONObject(URL(apiUrl).readText())
+        val versions = root.optJSONObject("versions") ?: return emptyList()
+        val result = mutableListOf<String>()
+        val keys = versions.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val array = versions.optJSONArray(key) ?: continue
+            for (index in 0 until array.length()) {
+                val version = array.optString(index)
+                if (version.isNotBlank() && !version.contains("pre", true) && !version.contains("rc", true) && version !in result) {
+                    result += version
+                }
+            }
+        }
+        return result.take(60)
+    }
+
+    fun install(config: ServerConfig = loadConfig()): File {
+        storage.initialize()
+        val provider = providers.provider(config.type)
+        val jar = provider.install(config)
+        provider.prepare(config)
+        return jar
+    }
+
+    fun start(config: ServerConfig, onLog: (String) -> Unit): Boolean {
+        check(eulaAccepted()) { "Minecraft EULA has not been accepted. Accept it in the setup screen before starting the server." }
+        val jar = File(storage.serverDir, "server.jar")
+        check(jar.exists()) { "Server jar is not installed yet." }
+        val provider = providers.provider(config.type)
+        provider.prepare(config)
+        val started = process.start(config, jar, provider.extraArgs(config), onLog)
+        if (started) connectTunnel(config, onLog)
+        return started
+    }
+
+    fun start(onLog: (String) -> Unit): Boolean {
+        val config = loadConfig()
+        val jar = install(config)
+        val provider = providers.provider(config.type)
+        val started = process.start(config, jar, provider.extraArgs(config), onLog)
+        if (started) connectTunnel(config, onLog)
+        return started
+    }
+
+    fun stop(force: Boolean = false) {
+        tunnel.disconnect()
+        network = NetworkStatus(message = if (configuration.loadLocaltonet().enabled) "Localtonet tunnel remains managed by the Localtonet client" else "Public tunnel disconnected")
+        process.stop(force)
+    }
+
+    fun sendCommand(command: String) = process.send(command)
+    fun isRunning(): Boolean = process.isRunning()
+
+    private fun connectTunnel(config: ServerConfig, onLog: (String) -> Unit) {
+        val localtonet = configuration.loadLocaltonet()
+        if (localtonet.enabled) {
+            network = NetworkStatus(
+                connected = localtonet.javaHost.isNotBlank() || localtonet.bedrockHost.isNotBlank(),
+                publicHost = localtonet.javaHost,
+                javaPort = localtonet.javaPort,
+                bedrockPort = localtonet.bedrockPort,
+                message = "Localtonet mode enabled; keep the Localtonet Android client tunnel running"
+            )
+            onLog("LOCALTONET: forward TCP ${config.javaPort} and UDP ${config.bedrockPort} to this device")
+            return
+        }
+        if (!tunnel.isConfigured()) {
+            network = NetworkStatus(message = "Server running locally; no public tunnel is configured")
+            return
+        }
+        var portReady = false
+        for (attempt in 0 until 12) {
+            if (!process.isRunning()) return
+            if (isLocalPortOpen(config.javaPort)) {
+                portReady = true
+                break
+            }
+            if (attempt < 11) Thread.sleep(1_000)
+        }
+        if (!portReady) {
+            network = NetworkStatus(message = "Server started but Java port ${config.javaPort} is not listening yet")
+        }
+        runCatching {
+            tunnel.connect(config.javaPort) { status -> network = status }
+        }.onFailure {
+            network = NetworkStatus(message = "Server running locally; tunnel connection failed: ${it.message ?: "unknown error"}")
+            onLog("TUNNEL ERROR: ${it.message ?: "unknown error"}")
+        }
+    }
+
+    private fun isLocalPortOpen(port: Int): Boolean = runCatching {
+        NetSocket().use { socket ->
+            socket.connect(NetInetSocketAddress("127.0.0.1", port), 750)
+        }
+        true
+    }.getOrDefault(false)
+    fun loadConfig(): ServerConfig = config() ?: error("Create a server first.")
+    fun createBackup(): File = backups.createBackup()
+
+    fun javaStatus(): String = runCatching { java.executable().absolutePath }
+        .getOrElse { it.message ?: "Android-compatible Java runtime not installed" }
+
+    fun autoSetupJava(): Result<String> = runCatching {
+        val executable = java.ensureInstalled()
+        val runtimeRoot = storage.runtimesDir.resolve("current")
+        val lib = runtimeRoot.resolve("lib")
+        val serverLib = lib.resolve("server")
+        check(lib.isDirectory) { "Bundled Java lib directory is missing: ${lib.absolutePath}" }
+        val process = ProcessBuilder(executable.absolutePath, "-version")
+            .directory(storage.serverDir)
+            .redirectErrorStream(true)
+        val env = process.environment()
+        env["JAVA_HOME"] = runtimeRoot.absolutePath
+        env["LD_LIBRARY_PATH"] = listOf(lib, serverLib).filter { it.isDirectory }.joinToString(":")
+        val started = process.start()
+        val output = started.inputStream.bufferedReader(StandardCharsets.UTF_8).use { it.readText().trim() }
+        val exit = started.waitFor()
+        check(exit == 0) { "Java validation failed (exit $exit):\n$output" }
+        output.ifBlank { "Java 21 Android runtime is ready." }
+    }
+
+    fun serverProperties(): Map<String, String> {
+        val file = File(storage.serverDir, "server.properties")
+        if (!file.exists()) return emptyMap()
+        val properties = Properties()
+        FileInputStream(file).use { properties.load(it) }
+        return properties.stringPropertyNames().sorted().associateWith { properties.getProperty(it, "") }
+    }
+
+    fun setServerProperty(key: String, value: String) {
+        require(key.matches(Regex("[A-Za-z0-9._-]+"))) { "Invalid server.properties key." }
+        val file = File(storage.serverDir, "server.properties")
+        storage.initialize()
+        val properties = Properties()
+        if (file.exists()) FileInputStream(file).use { properties.load(it) }
+        properties.setProperty(key, value)
+        FileOutputStream(file).use { properties.store(it, null) }
+    }
+
+    fun whitelistAdd(player: String) = sendCommand("whitelist add ${player.trim()}")
+    fun whitelistRemove(player: String) = sendCommand("whitelist remove ${player.trim()}")
+    fun banPlayer(player: String, reason: String = "") = sendCommand("ban ${player.trim()} ${reason.trim()}".trim())
+    fun pardonPlayer(player: String) = sendCommand("pardon ${player.trim()}")
+    fun kickPlayer(player: String, reason: String = "") = sendCommand("kick ${player.trim()} ${reason.trim()}".trim())
+
+    fun recentLogs(maxLines: Int = 200): List<String> {
+        val file = storage.logFile()
+        if (!file.exists()) return emptyList()
+        return file.readLines(StandardCharsets.UTF_8).takeLast(maxLines)
+    }
+
+    fun pluginFiles(): List<File> = storage.pluginsDir.listFiles()?.filter { it.isFile }?.sortedBy { it.name.lowercase() }.orEmpty()
+    fun modFiles(): List<File> = storage.modsDir.listFiles()?.filter { it.isFile }?.sortedBy { it.name.lowercase() }.orEmpty()
+
+    fun playerSummary(): String {
+        if (!isRunning()) return "Server offline."
+        val regex = Regex("There are (\\d+) of a max of (\\d+) players online")
+        val match = recentLogs(500).asReversed().firstNotNullOfOrNull { regex.find(it) }
+        return if (match != null) {
+            "${match.groupValues[1]} / ${match.groupValues[2]} players online (latest server status)"
+        } else {
+            "Server online. Live player data will appear after the server reports it."
+        }
+    }
+
+    fun networkStatus(): NetworkStatus = network
+
+    fun listBackups(): List<File> = storage.backupsDir.listFiles()
+        ?.filter { it.isDirectory }
+        ?.sortedByDescending { it.name }
+        .orEmpty()
+}
+
+class NetworkManager {
+    @Volatile var status = NetworkStatus(message = "No tunnel registration yet")
+        private set
+
+    fun setStatus(value: NetworkStatus) {
+        status = value
+    }
+}
+
+class AppRepository private constructor(context: Context) {
+    val serverManager = ServerManager(context)
+    val networkManager = NetworkManager()
+    val logs = ArrayDeque<String>(500)
+
+    @Synchronized
+    fun appendLog(line: String) {
+        if (logs.size >= 500) logs.removeFirst()
+        logs.addLast(line)
+    }
+
+    companion object {
+        @Volatile private var instance: AppRepository? = null
+
+        fun get(context: Context): AppRepository = instance ?: synchronized(this) {
+            instance ?: AppRepository(context.applicationContext).also { instance = it }
+        }
+    }
+}
+
+class RenderApiClient(
+    private val baseUrl: String,
+    private val token: String
+) {
+    private val client = OkHttpClient()
+
+    fun health(): Boolean {
+        if (baseUrl.isBlank() || token.isBlank()) return false
+        val request = Request.Builder()
+            .url(baseUrl.trimEnd('/') + "/health")
+            .header("Authorization", "Bearer $token")
+            .build()
+        return runCatching { client.newCall(request).execute().use { it.isSuccessful } }.getOrDefault(false)
+    }
+}
+
+class TunnelClient(
+    private val baseUrl: String,
+    private val token: String
+) {
+    private val client = OkHttpClient.Builder().pingInterval(20, TimeUnit.SECONDS).build()
+    private val streams = java.util.concurrent.ConcurrentHashMap<Int, java.net.Socket>()
+    @Volatile private var socket: okhttp3.WebSocket? = null
+    @Volatile private var connected = false
+
+    fun isConfigured(): Boolean = baseUrl.isNotBlank() && token.isNotBlank()
+    fun isConnected(): Boolean = connected
+
+    fun connect(localPort: Int, onStatus: (NetworkStatus) -> Unit = {}): Boolean {
+        check(isConfigured()) { "Render tunnel URL/token are not configured." }
+        disconnect()
+        val webSocketUrl = toWebSocketUrl(baseUrl.trimEnd('/')) + "/agent"
+        val request = Request.Builder().url(webSocketUrl).header("Authorization", "Bearer $token").build()
+        val opened = java.util.concurrent.CountDownLatch(1)
+        socket = client.newWebSocket(request, object : okhttp3.WebSocketListener() {
+            override fun onOpen(webSocket: okhttp3.WebSocket, response: okhttp3.Response) {
+                socket = webSocket
+                connected = true
+                opened.countDown()
+                onStatus(NetworkStatus(true, hostOf(baseUrl), localPort, null, "Tunnel connected"))
+            }
+
+            override fun onMessage(webSocket: okhttp3.WebSocket, bytes: okio.ByteString) {
+                handleFrame(bytes.toByteArray(), localPort, onStatus)
+            }
+
+            override fun onFailure(webSocket: okhttp3.WebSocket, t: Throwable, response: okhttp3.Response?) {
+                connected = false
+                closeStreams()
+                opened.countDown()
+                onStatus(NetworkStatus(false, message = "Tunnel failure: ${t.message ?: "connection error"}"))
+            }
+
+            override fun onClosed(webSocket: okhttp3.WebSocket, code: Int, reason: String) {
+                connected = false
+                closeStreams()
+                onStatus(NetworkStatus(false, message = "Tunnel closed: $reason"))
+            }
+        })
+        return opened.await(8, TimeUnit.SECONDS) && connected
+    }
+
+    fun disconnect() {
+        connected = false
+        socket?.close(1000, "client disconnect")
+        socket = null
+        closeStreams()
+    }
+
+    private fun handleFrame(frame: ByteArray, localPort: Int, onStatus: (NetworkStatus) -> Unit) {
+        if (frame.size < 5) return
+        val kind = frame[0].toInt() and 0xff
+        val id = java.nio.ByteBuffer.wrap(frame, 1, 4).int
+        when (kind) {
+            1 -> openLocalStream(id, localPort, onStatus)
+            2 -> streams[id]?.let { stream -> stream.getOutputStream().apply { write(frame, 5, frame.size - 5); flush() } }
+            3 -> closeStream(id)
+        }
+    }
+
+    private fun openLocalStream(id: Int, localPort: Int, onStatus: (NetworkStatus) -> Unit) {
+        if (streams.containsKey(id)) return
+        val local = runCatching {
+            java.net.Socket().apply { connect(java.net.InetSocketAddress("127.0.0.1", localPort), 8_000) }
+        }.getOrElse {
+            sendFrame(3, id)
+            onStatus(NetworkStatus(true, hostOf(baseUrl), localPort, null, "Tunnel connected; local Minecraft socket unavailable"))
+            return
+        }
+        streams[id] = local
+        Thread {
+            val buffer = ByteArray(64 * 1024)
+            try {
+                while (connected) {
+                    val count = local.getInputStream().read(buffer)
+                    if (count < 0) break
+                    if (count > 0) sendFrame(2, id, buffer, count)
+                }
+            } catch (_: Throwable) {
+            } finally {
+                sendFrame(3, id)
+                closeStream(id)
+            }
+        }.apply { name = "MCSERVER-tunnel-$id" }.start()
+    }
+
+    private fun sendFrame(kind: Int, id: Int, payload: ByteArray = ByteArray(0), length: Int = payload.size) {
+        val frame = ByteArray(5 + length)
+        frame[0] = kind.toByte()
+        java.nio.ByteBuffer.wrap(frame, 1, 4).putInt(id)
+        if (length > 0) System.arraycopy(payload, 0, frame, 5, length)
+        socket?.send(okio.ByteString.of(*frame))
+    }
+
+    private fun closeStream(id: Int) {
+        streams.remove(id)?.let { runCatching { it.close() } }
+    }
+
+    private fun closeStreams() {
+        streams.keys.toList().forEach(::closeStream)
+    }
+
+    private fun toWebSocketUrl(value: String): String = when {
+        value.startsWith("https://") -> "wss://" + value.removePrefix("https://")
+        value.startsWith("http://") -> "ws://" + value.removePrefix("http://")
+        value.startsWith("wss://") || value.startsWith("ws://") -> value
+        else -> "wss://$value"
+    }
+
+    private fun hostOf(value: String): String = runCatching { java.net.URI(value).host ?: "" }.getOrDefault("")
+}
+
+class BackupManager(private val storage: StorageManager) {
+    fun createBackup(): File {
+        storage.initialize()
+        val target = File(storage.backupsDir, "backup-${System.currentTimeMillis()}")
+        target.mkdirs()
+        copyDirectory(storage.serverDir, target, storage.backupsDir)
+        return target
+    }
+
+    private fun copyDirectory(source: File, target: File, exclude: File) {
+        source.listFiles().orEmpty().forEach { child ->
+            if (child.canonicalFile == exclude.canonicalFile) return@forEach
+            val destination = File(target, child.name)
+            if (child.isDirectory) {
+                destination.mkdirs()
+                copyDirectory(child, destination, exclude)
+            } else {
+                destination.parentFile?.mkdirs()
+                child.copyTo(destination, overwrite = false)
+            }
+        }
+    }
+}
+
+class ServerHostService : Service() {
+    companion object {
+        const val ACTION_START = "com.mcserver.app.START"
+        const val ACTION_STOP = "com.mcserver.app.STOP"
+        const val ACTION_RESTART = "com.mcserver.app.RESTART"
+        const val ACTION_FORCE_STOP = "com.mcserver.app.FORCE_STOP"
+        private const val CHANNEL_ID = "mcserver_host"
+        private const val NOTIFICATION_ID = 4001
+    }
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private lateinit var repository: AppRepository
+
+    override fun onCreate() {
+        super.onCreate()
+        repository = AppRepository.get(this)
+        createChannel()
+        startForeground(NOTIFICATION_ID, notification("MCSERVER host ready"))
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_START -> scope.launch {
+                runCatching {
+                    updateNotification("Starting Minecraft server")
+                    repository.serverManager.start { repository.appendLog(it) }
+                    updateNotification("Minecraft server running")
+                }.onFailure {
+                    repository.appendLog("START ERROR: ${it.message}")
+                    updateNotification("Server start failed")
+                }
+            }
+            ACTION_STOP -> scope.launch {
+                repository.serverManager.stop(false)
+                updateNotification("Minecraft server stopped")
+            }
+            ACTION_FORCE_STOP -> scope.launch {
+                repository.serverManager.stop(true)
+                updateNotification("Minecraft server force-stopped")
+            }
+            ACTION_RESTART -> scope.launch {
+                repository.serverManager.stop(false)
+                runCatching {
+                    updateNotification("Restarting Minecraft server")
+                    repository.serverManager.start { repository.appendLog(it) }
+                    updateNotification("Minecraft server running")
+                }.onFailure {
+                    repository.appendLog("RESTART ERROR: ${it.message}")
+                    updateNotification("Server restart failed")
+                }
+            }
+        }
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        repository.serverManager.stop(true)
+        scope.cancel()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(
+                NotificationChannel(CHANNEL_ID, "Minecraft server", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+    }
+
+    private fun updateNotification(text: String) {
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, notification(text))
+    }
+
+    private fun notification(text: String): Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+        .setContentTitle("MCSERVER")
+        .setContentText(text)
+        .setSmallIcon(android.R.drawable.stat_sys_download_done)
+        .setOngoing(true)
+        .build()
+}
